@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
+from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +420,7 @@ class HonchoMemoryProvider(MemoryProvider):
                     logger.warning("Honcho background session init failed: %s", e)
 
             self._init_thread = threading.Thread(
-                target=_run,
+                target=propagate_context_to_thread(_run),
                 daemon=True,
                 name="honcho-session-init",
             )
@@ -506,7 +507,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
             self._prefetch_thread_started_at = time.monotonic()
             prewarm_thread = threading.Thread(
-                target=_prewarm_dialectic, daemon=True, name="honcho-prewarm-dialectic"
+                target=propagate_context_to_thread(_prewarm_dialectic), daemon=True, name="honcho-prewarm-dialectic"
             )
             prewarm_thread.start()
             self._prefetch_thread = prewarm_thread
@@ -732,7 +733,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
             self._prefetch_thread_started_at = time.monotonic()
             first_turn_thread = threading.Thread(
-                target=_run_first_turn, daemon=True, name="honcho-prefetch-first"
+                target=propagate_context_to_thread(_run_first_turn), daemon=True, name="honcho-prefetch-first"
             )
             first_turn_thread.start()
             self._prefetch_thread = first_turn_thread
@@ -862,7 +863,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         self._prefetch_thread_started_at = time.monotonic()
         prefetch_thread = threading.Thread(
-            target=_run, daemon=True, name="honcho-prefetch"
+            target=propagate_context_to_thread(_run), daemon=True, name="honcho-prefetch"
         )
         prefetch_thread.start()
         self._prefetch_thread = prefetch_thread
@@ -1243,7 +1244,7 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
         self._sync_thread = threading.Thread(
-            target=_sync, daemon=True, name="honcho-sync"
+            target=propagate_context_to_thread(_sync), daemon=True, name="honcho-sync"
         )
         self._sync_thread.start()
 
@@ -1277,7 +1278,7 @@ class HonchoMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Honcho memory mirror failed: %s", e)
 
-        t = threading.Thread(target=_write, daemon=True, name="honcho-memwrite")
+        t = threading.Thread(target=propagate_context_to_thread(_write), daemon=True, name="honcho-memwrite")
         t.start()
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:

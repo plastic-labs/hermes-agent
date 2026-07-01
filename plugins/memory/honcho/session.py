@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 from plugins.memory.honcho.client import get_honcho_client
+from tools.thread_context import propagate_context_to_thread
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -146,7 +147,7 @@ class HonchoSessionManager:
         if write_frequency == "async":
             self._async_queue = queue.Queue()
             self._async_thread = threading.Thread(
-                target=self._async_writer_loop,
+                target=propagate_context_to_thread(self._async_writer_loop),
                 name="honcho-async-writer",
                 daemon=True,
             )
@@ -675,7 +676,7 @@ class HonchoSessionManager:
             if result:
                 self.set_context_result(session_key, result)
 
-        t = threading.Thread(target=_run, name="honcho-context-prefetch", daemon=True)
+        t = threading.Thread(target=propagate_context_to_thread(_run), name="honcho-context-prefetch", daemon=True)
         t.start()
 
     def set_context_result(self, session_key: str, result: dict[str, str]) -> None:
