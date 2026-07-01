@@ -17,6 +17,7 @@ import json
 import os
 import logging
 import hashlib
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -739,7 +740,32 @@ class HonchoClientConfig:
         return self.workspace_id
 
 
-_honcho_client_slot: SingletonSlot = SingletonSlot()
+# Per-profile client cache: single-process multi-profile runtimes (desktop
+# tui_gateway, multiplexed gateway) switch profile via the HERMES_HOME override,
+# so one process-global client would pin every profile to whoever built it first
+# and leak its workspace + credentials. Keyed by profile path, not workspace, so
+# two profiles can still intentionally share one workspace.
+_honcho_client_slots: dict[str, SingletonSlot] = {}
+_honcho_slots_lock = threading.Lock()
+
+
+def _honcho_client_cache_key() -> str:
+    """Resolved HERMES_HOME for the active profile — the client cache key."""
+    try:
+        return str(get_hermes_home().resolve())
+    except Exception:
+        return "<default>"
+
+
+def _get_honcho_client_slot() -> SingletonSlot:
+    """Return the active profile's client slot, creating it on first use."""
+    key = _honcho_client_cache_key()
+    with _honcho_slots_lock:
+        slot = _honcho_client_slots.get(key)
+        if slot is None:
+            slot = SingletonSlot()
+            _honcho_client_slots[key] = slot
+        return slot
 
 
 def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
@@ -758,11 +784,13 @@ def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
         logger.warning("Honcho OAuth pre-build refresh failed", exc_info=True)
 
 
-def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -> None:
+def _refresh_cached_oauth(
+    client: "Honcho", config: HonchoClientConfig | None, slot: SingletonSlot
+) -> None:
     """Rotate the cached client's Bearer in place when its OAuth token is stale.
 
-    If the SDK shape changed and the in-place rotation can't apply, the slot is
-    reset so the next acquisition rebuilds with the fresh token.
+    If the SDK shape changed and the in-place rotation can't apply, this
+    profile's slot is reset so the next acquisition rebuilds with the fresh token.
     """
     try:
         from plugins.memory.honcho import oauth
@@ -770,24 +798,27 @@ def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -
         host = config.host if config is not None else resolve_active_host()
         token, refreshed = oauth.ensure_fresh_token(resolve_config_path(), host)
         if refreshed and token and not oauth.apply_token_to_client(client, token):
-            _honcho_client_slot.reset()
+            slot.reset()
     except Exception:
         logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
 
 
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
-    """Get or create the Honcho client singleton.
+    """Get or create the Honcho client for the active profile.
 
     When no config is provided, attempts to load ~/.honcho/config.json
     first, falling back to environment variables.
 
-    Thread-safe: the client is built exactly once even under concurrent
-    first calls (double-checked locking via ``SingletonSlot``), so racing
-    threads can't each construct a client and leak the loser's connection.
+    The client is cached per profile (keyed by resolved HERMES_HOME), so a
+    single-process multi-profile runtime can't serve profile B off profile A's
+    frozen workspace/credentials. Thread-safe: each profile's client is built
+    exactly once even under concurrent first calls (double-checked locking via
+    ``SingletonSlot``), so racing threads can't leak the loser's connection.
     """
-    cached = _honcho_client_slot.peek()
+    slot = _get_honcho_client_slot()
+    cached = slot.peek()
     if cached is not None:
-        _refresh_cached_oauth(cached, config)
+        _refresh_cached_oauth(cached, config, slot)
         return cached
 
     if config is None:
@@ -912,9 +943,17 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
 
         return Honcho(**kwargs)
 
-    return _honcho_client_slot.get(_build)
+    return slot.get(_build)
 
 
 def reset_honcho_client() -> None:
-    """Reset the Honcho client singleton (useful for testing)."""
-    _honcho_client_slot.reset()
+    """Reset every cached Honcho client (all profiles).
+
+    Used by tests and by setup/OAuth flows that reconfigure Honcho and need the
+    next acquisition to rebuild against the new config.
+    """
+    with _honcho_slots_lock:
+        slots = list(_honcho_client_slots.values())
+        _honcho_client_slots.clear()
+    for slot in slots:
+        slot.reset()
