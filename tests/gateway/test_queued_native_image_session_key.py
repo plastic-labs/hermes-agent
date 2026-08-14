@@ -56,7 +56,7 @@ class CaptureQueuedNativeImageAgent:
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls.append(message)
         return {
             "final_response": f"done-{len(type(self).calls)}",

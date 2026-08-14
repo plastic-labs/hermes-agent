@@ -1262,7 +1262,7 @@ class TestRunIdempotency:
                 assert (await first.json())["run_id"] != (await second.json())["run_id"]
 
     @pytest.mark.asyncio
-    async def test_memory_scope_participates_in_fingerprint(
+    async def test_scope_participates_in_fingerprint(
         self, auth_adapter, tmp_path
     ):
         adapter = auth_adapter
