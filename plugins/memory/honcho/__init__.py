@@ -116,6 +116,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
         # Recall cadence state (overwritten from config in initialize()).
         self._turn_count = 0
+        # Author of the turn in flight, refreshed by on_turn_start.
+        self._turn_author: dict[str, Any] = {}
         self._query_rewrite_enabled = False
         self._injection_frequency = "every-turn"  # or "first-turn"
         self._context_cadence = 1   # minimum turns between context API calls
@@ -533,8 +535,11 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     _is_trivial_prompt = staticmethod(is_trivial_prompt)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Track turn count for cadence and injection_frequency logic."""
+        """Track turn count for cadence, and record who wrote this turn: a shared session carries
+        several participants, and the peer resolved at session init only names whoever opened it."""
         self._turn_count = turn_number
+        self._turn_author = {"id": kwargs.get("author_id") or None, "name": kwargs.get("author_name") or None,
+                             "is_bot": bool(kwargs.get("author_is_bot"))}
 
     # ----- Writes -----
 
@@ -592,11 +597,16 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if not clean_user_content and not clean_assistant_content:
             return
 
+        # Resolved before the thread starts so a following turn cannot retag a queued write.
+        author_peer_id = self._manager.resolve_author_peer_id(
+            self._session_key, self._turn_author.get("id"), self._turn_author.get("name"))
+
         def _sync():
             session = self._manager.get_or_create(self._session_key)
-            for role, content in (("user", clean_user_content), ("assistant", clean_assistant_content)):
-                for chunk in self._chunk_message(content, msg_limit) if content else ():
-                    session.add_message(role, chunk)
+            for chunk in self._chunk_message(clean_user_content, msg_limit) if clean_user_content else ():
+                session.add_message("user", chunk, author_peer_id=author_peer_id)
+            for chunk in self._chunk_message(clean_assistant_content, msg_limit) if clean_assistant_content else ():
+                session.add_message("assistant", chunk)
             # save() (not _flush_session) so writeFrequency batching is honored.
             self._manager.save(session)
 
