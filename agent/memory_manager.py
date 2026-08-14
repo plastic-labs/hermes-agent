@@ -559,8 +559,8 @@ class MemoryManager:
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 
-        # Propagate the caller's contextvars (profile HERMES_HOME override)
-        # to the prefetch thread — see _submit_background.
+        # The prefetch thread must see the caller's profile override — see
+        # _submit_background.
         import contextvars
 
         _ctx = contextvars.copy_context()

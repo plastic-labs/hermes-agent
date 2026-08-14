@@ -461,12 +461,9 @@ class HonchoClientConfig:
     # block exists or enabled was set explicitly), vs auto-enabled from a
     # stray HONCHO_API_KEY env var.
     explicitly_configured: bool = False
-    # Provenance: WHERE this config was resolved from, captured at resolution
-    # time (inside the caller's profile scope). Bound consumers (session
-    # manager, OAuth refresh paths) use these instead of re-resolving
-    # resolve_config_path()/get_hermes_home() later — those resolvers read a
-    # ContextVar that background threads cannot see, so re-resolution from a
-    # daemon thread silently lands on the DEFAULT profile (#69123, #74065).
+    # Captured at resolution time. Bound consumers use these instead of
+    # re-resolving later: the resolvers read a ContextVar background threads
+    # cannot see, so re-resolution lands on the DEFAULT profile (#69123, #74065).
     config_path: Path | None = None
     hermes_home: Path | None = None
 
@@ -877,11 +874,9 @@ class HonchoClientConfig:
 
 
 _honcho_client_slot: SingletonSlot = SingletonSlot()
-# --- per-identity client cache -------------------------------------------
-# One slot per client identity, replacing the single process-wide slot that
-# pinned the first profile's workspace and bearer for every later profile in
-# multi-profile processes (#69123 multiplexed gateway, #74065 dashboard).
-# The legacy names above are retained only for reset bookkeeping.
+# One slot per client identity: a single process-wide slot pinned the first
+# profile's workspace and bearer for every later profile (#69123, #74065).
+# The legacy slot above remains only for reset bookkeeping.
 import threading as _threading
 
 _client_slots: dict[tuple, SingletonSlot] = {}
@@ -937,9 +932,9 @@ def _credential_fingerprint(config: HonchoClientConfig | None) -> str:
             else:
                 return ""
             return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
-        # Ambient: read the active file so legacy no-config callers still get
-        # a credential-aware key (correct on main threads; bound configs are
-        # the supported path for background threads).
+        # No config passed: read the active file so legacy callers still get
+        # a credential-aware key. Correct on main threads; background threads
+        # must pass a bound config.
         path = resolve_config_path()
         if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1019,15 +1014,11 @@ def _slot_for(key: tuple) -> SingletonSlot:
             slot = SingletonSlot()
             _client_slots[key] = slot
         return slot
-# Memo for the honcho.json-derived timeout, keyed PER CONFIG PATH on the
-# file's mtime_ns so the staleness check on every get_honcho_client() call
-# costs one stat() instead of a JSON parse. Path-keyed because multi-profile
-# processes resolve different honcho.json files — a single-slot memo would
-# thrash between profiles and return profile A's timeout for profile B.
-# mtime -1 = file absent. config.yaml needs no such memo:
-# load_config_readonly() is internally cached on both the user and managed
-# files' signatures, and a bespoke key here would have to duplicate that
-# invalidation logic.
+# Memo for the honcho.json-derived timeout, keyed per config path on the
+# file's mtime_ns: one stat() per get_honcho_client() call instead of a JSON
+# parse, and a single-slot memo would return profile A's timeout for profile
+# B. mtime -1 = file absent. config.yaml needs no memo: load_config_readonly()
+# is already cached on its files' signatures.
 _honcho_json_timeout_memo: dict[str, tuple[int, float | None]] = {}
 
 
@@ -1107,10 +1098,9 @@ def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
     try:
         from plugins.memory.honcho import oauth
 
-        # Bound path: refresh against the honcho.json this config came from,
-        # not whatever the current context resolves to. On daemon threads the
-        # ambient resolver lands on the default profile and a refresh here
-        # would persist the rotated token into the WRONG profile's file.
+        # On daemon threads the ambient resolver lands on the default profile
+        # — a refresh there would persist the rotated token into the WRONG
+        # profile's file.
         token, _ = oauth.ensure_fresh_token(config.bound_config_path(), config.host)
         if token:
             config.api_key = token
