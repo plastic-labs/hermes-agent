@@ -598,6 +598,18 @@ class HonchoSessionManager:
 
         return self._session_key_fallback_peer_id(key)
 
+    def subject_peer_id(self, key: str) -> str:
+        """The peer id this session's injected memory is about.
+
+        Prefers the live session's resolved id and falls back to re-resolving
+        from config, so a caller that only needs the name for display does not
+        have to force session creation to get it.
+        """
+        session = self._cache.get(key)
+        if session and getattr(session, "user_peer_id", ""):
+            return str(session.user_peer_id)
+        return self._resolve_user_peer_id(key)
+
     def get_or_create(self, key: str) -> HonchoSession:
         """
         Get an existing session or create a new one.
