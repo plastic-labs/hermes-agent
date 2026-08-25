@@ -4,6 +4,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import {
@@ -15,6 +16,7 @@ import {
   type SessionResumeResponse
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
@@ -91,7 +93,11 @@ const RUNTIME_SESSION_ID = 'rt-new-001'
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'removeSession' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  | 'createBackendSessionForSend'
+  | 'openNewSessionTile'
+  | 'removeSession'
+  | 'selectSidebarItem'
+  | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -806,6 +812,7 @@ describe('resumeSession failure recovery', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    clearClarifyRequest()
     vi.restoreAllMocks()
   })
 
@@ -821,6 +828,132 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
+
+  it.each([
+    ['Codex tool-only', ''],
+    ['DeepSeek text-plus-tool', 'I found two paths; choose one.']
+  ])('restores a pending clarify as a running inline card for a %s transcript', async (_shape, content) => {
+    const stateMapRef: MutableRefObject<Map<string, ClientSessionState>> = { current: new Map() }
+
+    const toolCall = {
+      function: { arguments: '{"question":"Which path?","choices":["safe","fast"]}', name: 'clarify' },
+      id: 'call-provider'
+    }
+
+    setSessions([storedSession({ id: 'stored-1', message_count: 2 })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        { content, role: 'assistant', timestamp: 2, tool_calls: [toolCall] }
+      ],
+      session_id: 'stored-1'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          pending_clarify: {
+            choices: ['safe', 'fast'],
+            question: 'Which path?',
+            request_id: 'req-resumed'
+          },
+          resumed: 'stored-1',
+          running: true,
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, { sessionStateByRuntimeIdRef: stateMapRef })
+
+    const state = stateMapRef.current.get('runtime-1')
+
+    const clarifyMessages =
+      state?.messages.filter(message =>
+        message.parts.some(part => part.type === 'tool-call' && part.toolName === 'clarify')
+      ) ?? []
+
+    expect(clarifyMessages).toHaveLength(1)
+    expect(clarifyMessages[0].pending).toBe(true)
+    expect(state?.streamId).toBe(clarifyMessages[0].id)
+    expect($clarifyRequests.get()['runtime-1']).toMatchObject({ requestId: 'req-resumed', question: 'Which path?' })
+  })
+
+  it('restores a pending batch clarify whose resume snapshot has no top-level question', async () => {
+    const stateMapRef: MutableRefObject<Map<string, ClientSessionState>> = { current: new Map() }
+
+    setSessions([storedSession({ id: 'stored-1', message_count: 2 })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: '',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"questions":[{"question":"Color?"},{"question":"Size?"}]}',
+                name: 'clarify'
+              },
+              id: 'call-batch-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-1'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          pending_clarify: {
+            answers: { q0: 'Blue' },
+            questions: [
+              { choices: ['Blue', 'Red'], qid: 'q0', question: 'Color?' },
+              { choices: ['Small', 'Large'], qid: 'q1', question: 'Size?' }
+            ],
+            request_id: 'req-batch-resumed'
+          },
+          resumed: 'stored-1',
+          running: true,
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, { sessionStateByRuntimeIdRef: stateMapRef })
+
+    const state = stateMapRef.current.get('runtime-1')
+    const request = $clarifyRequests.get()['runtime-1']
+    expect(request).toMatchObject({
+      lockedAnswers: { q0: 'Blue' },
+      question: '',
+      requestId: 'req-batch-resumed'
+    })
+    expect(request.questions).toHaveLength(2)
+    expect(
+      state?.messages
+        .flatMap(message => message.parts)
+        .filter(part => part.type === 'tool-call' && part.toolName === 'clarify')
+    ).toHaveLength(1)
+    expect(state?.messages.filter(message => message.pending)).toHaveLength(1)
+    expect(state?.streamId).toBe(state?.messages.find(message => message.pending)?.id)
+  })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
@@ -1858,6 +1991,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       .mockReset()
       .mockResolvedValue({ messages: [] } as never)
     vi.mocked(requestGatewayForAgent).mockReset()
+    clearClarifyRequest()
     vi.restoreAllMocks()
   })
 
@@ -2119,6 +2253,265 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('re-arms a pending clarify in place on the warm session.activate path', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.messages = [
+      { id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] },
+      {
+        id: 'cached-assistant',
+        role: 'assistant',
+        parts: [
+          { type: 'text', text: 'I found two paths.' },
+          {
+            type: 'tool-call',
+            toolCallId: 'call-provider',
+            toolName: 'clarify',
+            args: { choices: ['safe', 'fast'], question: 'Which path?' },
+            argsText: '{"question":"Which path?","choices":["safe","fast"]}'
+          }
+        ]
+      }
+    ]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: 'I found two paths.',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"question":"Which path?","choices":["safe","fast"]}',
+                name: 'clarify'
+              },
+              id: 'call-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-A'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          pending_clarify: {
+            choices: ['safe', 'fast'],
+            question: 'Which path?',
+            request_id: 'req-warm'
+          },
+          resumed: 'stored-A',
+          running: true,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    const resumedState = sessionStateByRuntimeIdRef.current.get('rt-A')
+
+    const clarifyMessages =
+      resumedState?.messages.filter(message =>
+        message.parts.some(part => part.type === 'tool-call' && part.toolName === 'clarify')
+      ) ?? []
+
+    expect(requestGateway.mock.calls.map(([method]) => method)).toContain('session.activate')
+    expect(clarifyMessages).toHaveLength(1)
+    expect(clarifyMessages[0].pending).toBe(true)
+    expect(
+      clarifyMessages[0].parts.find(part => part.type === 'tool-call' && part.toolName === 'clarify')
+    ).toMatchObject({ toolCallId: 'call-provider' })
+    expect(resumedState?.streamId).toBe(clarifyMessages[0].id)
+    expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-warm' })
+  })
+
+  it.each([
+    ['with a stale request-store entry', true],
+    ['after the request store was already cleared', false]
+  ])('de-arms stale clarify state %s when session.activate reports no pending request', async (_case, keepStore) => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.busy = true
+    state.needsInput = true
+    state.streamId = 'cached-assistant'
+    state.messages = [
+      { id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] },
+      {
+        id: 'cached-assistant',
+        role: 'assistant',
+        pending: true,
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-provider',
+            toolName: 'clarify',
+            args: { choices: ['safe', 'fast'], question: 'Which path?' },
+            argsText: '{"question":"Which path?","choices":["safe","fast"]}'
+          }
+        ]
+      }
+    ]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    if (keepStore) {
+      setClarifyRequest({
+        choices: ['safe', 'fast'],
+        multiSelect: false,
+        question: 'Which path?',
+        requestId: 'req-stale',
+        sessionId: 'rt-A'
+      })
+    }
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: '',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"question":"Which path?","choices":["safe","fast"]}',
+                name: 'clarify'
+              },
+              id: 'call-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-A'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    const resumedState = sessionStateByRuntimeIdRef.current.get('rt-A')
+
+    const clarifyPart = resumedState?.messages
+      .flatMap(message => message.parts)
+      .find(part => part.type === 'tool-call' && part.toolName === 'clarify')
+
+    expect($clarifyRequests.get()['rt-A']).toBeUndefined()
+    expect(resumedState).toMatchObject({ needsInput: false, streamId: null })
+    expect(resumedState?.messages.find(message => message.id === resumedState.streamId)).toBeUndefined()
+    expect(clarifyPart).toHaveProperty('result')
+  })
+
+  it('does not let an older activate response clear a newer clarify request', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', clientState('stored-A')]])
+    }
+
+    const activated = deferred<SessionResumeResponse>()
+
+    const requestGateway = vi.fn((method: string) =>
+      method === 'session.activate' ? activated.promise : Promise.resolve({})
+    )
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway as never}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    const resumePromise = resume!('stored-A', true)
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.anything()))
+
+    setClarifyRequest({
+      choices: ['new'],
+      multiSelect: false,
+      question: 'New question?',
+      receivedAt: Date.now() / 1000 + 60,
+      requestId: 'req-newer',
+      sessionId: 'rt-A'
+    })
+    activated.resolve({
+      info: {},
+      message_count: 0,
+      messages: [],
+      messages_omitted: true,
+      resumed: 'stored-A',
+      running: false,
+      session_id: 'rt-A',
+      session_key: 'stored-A'
+    })
+    await resumePromise
+
+    expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-newer' })
   })
 
   it('preserves cached image attachments through an idle persisted transcript refresh', async () => {
@@ -2754,6 +3147,7 @@ describe('createBackendSessionForSend workspace target', () => {
     cleanup()
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
+    $projectScope.set(ALL_PROJECTS)
     setCurrentCwd('')
     setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
@@ -2786,6 +3180,69 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+
+  it('does not inherit a stale cwd when Home is the active project scope', async () => {
+    const params = await createWith(
+      () => {
+        $projectScope.set(NO_PROJECT_ID)
+      },
+      () => {
+        // Simulate the stale live path left by the previously selected project
+        // before the new draft is submitted.
+        $currentCwd.set('/previous-project')
+      }
+    )
+
+    expect(params).not.toHaveProperty('cwd')
+  })
+})
+
+describe('openNewSessionTile workspace target', () => {
+  afterEach(() => {
+    cleanup()
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
+    vi.restoreAllMocks()
+  })
+
+  it('omits cwd for a Home tile even when project scope resolves to a repo', async () => {
+    $projectScope.set('p_voice')
+    $projectTree.set([
+      {
+        id: 'p_voice',
+        label: 'Voice Assistant',
+        path: '/Users/oschmidt/Checkouts/voice-assistant',
+        repos: [],
+        sessionCount: 0
+      } as never
+    ])
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return {
+          info: { cwd: '', model: 'test-model', tools: {}, skills: {} },
+          session_id: RUNTIME_SESSION_ID,
+          stored_session_id: 'stored-home-tile'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: null, listed: false })
+    })
+
+    expect(createParams).not.toHaveProperty('cwd')
   })
 })
 describe('selectSidebarItem', () => {

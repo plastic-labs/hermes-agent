@@ -413,6 +413,9 @@ export const ja = defineLocale({
         'iMessage風の絵文字タップバック — メッセージにリアクションでき、Hermesもあなたのメッセージにリアクションします。',
       composerPopoutTitle: 'フローティング入力欄',
       composerPopoutDesc: '入力欄をドックからドラッグして外せるようにします。オフにすると画面下部に固定されます。',
+      vibeHeartsTitle: 'バイブハート',
+      vibeHeartsDesc:
+        'ありがとう・愛してる・good bot・ハート絵文字のときに浮かぶハート。上のメッセージリアクションとは別です。',
       embedsTitle: 'インライン埋め込み',
       embedsDesc:
         'リッチプレビューは第三者サイト（YouTube、X など）から読み込まれます。確認は許可するまでプレースホルダーを表示し、常には自動で読み込み、オフはリンクのままにします。',
@@ -993,7 +996,6 @@ export const ja = defineLocale({
       providerDefault: '(プロバイダーのデフォルト)',
       tasks: {
         vision: { label: 'ビジョン', hint: '画像分析' },
-        web_extract: { label: 'ウェブ抽出', hint: 'ページの要約' },
         compression: { label: '圧縮', hint: 'コンテキストの圧縮' },
         skills_hub: { label: 'スキルハブ', hint: 'スキル検索' },
         approval: { label: '承認', hint: 'スマート自動承認' },
