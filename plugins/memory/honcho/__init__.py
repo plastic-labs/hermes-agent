@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -28,7 +29,6 @@ from plugins.memory.honcho.client import spawn_context_thread
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
-
 
 # Gateway-internal notifications can arrive through the same user-role channel
 # as genuine user messages. They are execution metadata, not conversation, and
@@ -291,6 +291,16 @@ class HonchoMemoryProvider(MemoryProvider):
         self._base_context_cache: Optional[str] = None
         self._base_context_lock = threading.Lock()
 
+        # Injection audit (see _log_injection). Off unless explicitly enabled:
+        # the record contains the user's representation verbatim.
+        self._injection_log_path: Optional[str] = None
+        self._injection_log_lock = threading.Lock()
+
+        # Pinned `injection.sessionStart` component list, or None when the
+        # caller pinned none. None means "render whatever the backend returned",
+        # which is the historical behaviour — see _format_first_turn_context.
+        self._session_start_components: Optional[frozenset] = None
+
         # Recall cadence and liveness state.
         self._turn_count = 0
         self._query_rewrite_enabled = False
@@ -404,6 +414,10 @@ class HonchoMemoryProvider(MemoryProvider):
             self._reasoning_heuristic = cfg.reasoning_heuristic
             if cfg.reasoning_level_cap in self._LEVEL_ORDER:
                 self._reasoning_level_cap = cfg.reasoning_level_cap
+
+            raw = getattr(cfg, "raw", None) or {}
+            self._injection_log_path = self._resolve_injection_log_path(raw)
+            self._session_start_components = self._resolve_session_start(raw)
 
             # aiPeer comes from honcho.json (host block or root) only.
             # SOUL.md is persona content, not identity config.
@@ -647,30 +661,50 @@ class HonchoMemoryProvider(MemoryProvider):
             return True
         return not (self._init_thread and self._init_thread.is_alive())
 
+    #: ``injection.sessionStart`` component name -> (context key, heading).
+    #: Order is the render order, and is deliberately independent of the order
+    #: components are listed in config: a caller reordering its list should not
+    #: silently reorder the agent's context.
+    _SESSION_START_COMPONENTS = (
+        ("summary", "summary", "## Session Summary"),
+        ("peerRepresentation", "representation", "## User Representation"),
+        ("peerCard", "card", "## User Peer Card"),
+        ("aiRepresentation", "ai_representation", "## AI Self-Representation"),
+        ("aiCard", "ai_card", "## AI Identity Card"),
+    )
+
     def _format_first_turn_context(self, ctx: dict) -> str:
-        """Format the prefetch context dict into a readable system prompt block."""
+        """Render the prefetch context, honouring ``injection.sessionStart``.
+
+        Unconfigured callers are unaffected: ``None`` means no list was pinned, and
+        everything renders. An explicitly empty list means "inject nothing" and is
+        honoured as such rather than being treated as unset — the two are different
+        instructions.
+        """
+        allowed = self._session_start_components
         parts = []
+        suppressed = []
 
-        # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
-        if summary:
-            parts.append(f"## Session Summary\n{summary}")
+        for name, key, heading in self._SESSION_START_COMPONENTS:
+            value = ctx.get(key, "")
+            if not value:
+                continue
+            if allowed is not None and name not in allowed:
+                # Recorded, not dropped silently: a component the backend
+                # returned and this filter withheld is a decision worth being
+                # able to see in a log, not an absence to be inferred later.
+                suppressed.append(f"{name} ({len(value)}B)")
+                continue
+            parts.append(f"{heading}\n{value}")
 
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
-
-        card = ctx.get("card", "")
-        if card:
-            parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
-
-        ai_card = ctx.get("ai_card", "")
-        if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
+        if suppressed:
+            logger.debug(
+                "Honcho session-start injection filtered by config: kept %s, "
+                "suppressed %s",
+                [n for n, k, _ in self._SESSION_START_COMPONENTS
+                 if ctx.get(k) and (allowed is None or n in allowed)],
+                suppressed,
+            )
 
         if not parts:
             return ""
@@ -719,6 +753,95 @@ class HonchoMemoryProvider(MemoryProvider):
 
         return header
 
+    @staticmethod
+    def _resolve_session_start(raw: dict) -> Optional[frozenset]:
+        """The pinned ``injection.sessionStart`` list, or None if unpinned.
+
+        Returns a set rather than the list because order is fixed by the render
+        table, and ``None`` rather than an empty set for "unpinned" so that a
+        caller asking for *nothing* stays distinguishable from a caller who
+        never asked. Unknown names are kept.
+        """
+        injection = raw.get("injection")
+        if not isinstance(injection, dict):
+            return None
+        listed = injection.get("sessionStart")
+        if not isinstance(listed, (list, tuple)):
+            return None
+        return frozenset(str(x) for x in listed)
+
+    @staticmethod
+    def _resolve_injection_log_path(raw: dict) -> Optional[str]:
+        """Where to write the injection audit, or None to keep it off.
+
+        Enabled by the ``logging`` config key or ``HONCHO_LOGGING`` — both of
+        which callers already set today and neither of which had any effect
+        before this. Rather than add a seventh knob, this gives the existing
+        ones a job.
+
+        ``HONCHO_INJECTION_LOG`` overrides the destination outright, for
+        harnesses that collect from a fixed path.
+        """
+        explicit = os.environ.get("HONCHO_INJECTION_LOG")
+        if explicit:
+            return explicit
+        enabled = raw.get("logging")
+        if enabled is None:
+            enabled = os.environ.get("HONCHO_LOGGING", "").lower() in ("1", "true", "yes")
+        if not enabled:
+            return None
+        # Beside the plugin's own config, which every caller already creates.
+        return os.path.join(
+            os.path.expanduser("~"), ".honcho", "injection.log"
+        )
+
+    def _log_injection(self, reason: str, payload: str = "") -> str:
+        """Record what this turn's injection contained and why, then return it.
+
+        Why the *reason* and not just the payload: ``prefetch`` has several
+        distinct ways to return an empty string — cron guard, tools-only mode,
+        session not ready, trivial prompt, and "fetched but everything came
+        back empty". They have opposite fixes, and an empty
+        payload on its own cannot tell them apart. Logging only the bytes would
+        reproduce, one layer down, exactly the failure that makes injection
+        audits untrustworthy: a zero that means "could not look" being read as a
+        zero that means "nothing was delivered".
+
+        The turn number is recorded for the same reason. Base context is served
+        asynchronously — the first fetch caches an empty string and consumes the
+        real result on a later turn — so *when* a payload arrives decides
+        whether the agent had it while choosing its approach or only in time to
+        write the closing summary. That difference is invisible in any
+        aggregate.
+
+        Returns ``payload`` unchanged so call sites stay ``return
+        self._log_injection(...)``, and is deliberately swallow-everything: an
+        audit that can break the agent is worse than no audit.
+        """
+        path = self._injection_log_path
+        if not path:
+            return payload
+        try:
+            record = json.dumps(
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "turn": self._turn_count,
+                    "session_key": self._session_key or "",
+                    "recall_mode": self._recall_mode,
+                    "reason": reason,
+                    "bytes": len(payload.encode("utf-8")),
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+            )
+            with self._injection_log_lock:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(record + "\n")
+        except Exception as e:  # pragma: no cover - diagnostics must never bite
+            logger.debug("Honcho injection log write failed: %s", e)
+        return payload
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return base context (representation + card) plus dialectic supplement.
 
@@ -730,11 +853,11 @@ class HonchoMemoryProvider(MemoryProvider):
         frequency and context budget.
         """
         if self._cron_skipped:
-            return ""
+            return self._log_injection("cron-guard")
 
         # Tools-only mode has no automatic injection.
         if self._recall_mode == "tools":
-            return ""
+            return self._log_injection("tools-only-mode")
 
         first_turn_base_deadline = None
         if self._turn_count <= 1:
@@ -755,7 +878,9 @@ class HonchoMemoryProvider(MemoryProvider):
                     )
             if not self._session_ready():
                 # A failed auth init still owes the user the one-time notice.
-                return self._pop_auth_notice()
+                return self._log_injection(
+                    "session-not-ready", self._pop_auth_notice()
+                )
 
         # First-turn mode suppresses only the base layer; dialectic is independent.
         _skip_base = (
@@ -765,7 +890,11 @@ class HonchoMemoryProvider(MemoryProvider):
         # Trivial turns start no work, but may consume a ready pending result.
         if self._is_trivial_prompt(query):
             ready = self._consume_pending_dialectic()
-            return self._truncate_to_budget(ready) if ready else ""
+            if ready:
+                return self._log_injection(
+                    "trivial-prompt-pending-dialectic", self._truncate_to_budget(ready)
+                )
+            return self._log_injection("trivial-prompt")
 
         parts = []
 
@@ -894,13 +1023,13 @@ class HonchoMemoryProvider(MemoryProvider):
             parts.append(dialectic_result)
 
         if not parts:
-            return ""
+            return self._log_injection("fetched-but-empty")
 
         result = "\n\n".join(parts)
 
         result = self._truncate_to_budget(result)
 
-        return result
+        return self._log_injection("injected", result)
 
     def _pop_auth_notice(self) -> str:
         """One-time model-facing notice that Honcho auth expired and memory is paused."""
