@@ -30,6 +30,75 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+#: Matches the server-rendered "## Explicit Observations" section up to the
+#: next "## " heading (or end of string). The heading text is stable formatter
+#: output from Honcho's ``Representation.format_as_markdown``.
+_EXPLICIT_OBSERVATIONS_SECTION = re.compile(
+    r"^## Explicit Observations\s*\n.*?(?=^## |\Z)", re.MULTILINE | re.DOTALL
+)
+
+#: Opens the injected block. Names the peer the memory is about and binds it to
+#: the person the agent is serving right now, so a third-person representation
+#: ("mei wants ...") is not read as notes about somebody else.
+_MEMORY_SUBJECT_HEADER_NAMED = (
+    "## Who this memory is about\n"
+    "You are working with `{peer}` in this session. Everything below was learned "
+    "about `{peer}` in earlier sessions with them. It describes the user whose "
+    "task you are working on right now — not a third party, and not some other "
+    "project's requirements."
+)
+
+#: Same, for when the peer id cannot be resolved. Naming the wrong person would
+#: be worse than naming nobody, so the fallback asserts the binding without one.
+_MEMORY_SUBJECT_HEADER = (
+    "## Who this memory is about\n"
+    "Everything below was learned about the user you are working with in this "
+    "session, during earlier sessions with them. It describes the user whose "
+    "task you are working on right now — not a third party, and not some other "
+    "project's requirements."
+)
+
+#: Closes the injected block. Placed last so it is the most recent thing the
+#: model reads before it starts work, and phrased to answer the three ways the
+#: block gets discarded: as another project's business, as background rather
+#: than instruction, and as outranked by the agent's own style defaults.
+_MEMORY_DIRECTIVE = (
+    "## Applying this memory\n"
+    "The preferences and instructions above are standing requirements from the "
+    "user you are working with now. They hold until that user changes them.\n"
+    "They are not scoped to the project, language, or repository they were "
+    "stated in. Apply them to the task in front of you now, even when that task "
+    "is in an unrelated domain, codebase, or language: a requirement about how "
+    "to write code or how to report back describes how this user wants you to "
+    "work, not merely what they wanted on the day they said it.\n"
+    "Where a requirement names an exact marker, wording, or format, reproduce it "
+    "literally instead of paraphrasing it or applying it in spirit.\n"
+    "Where a requirement conflicts with your own defaults — brevity, matching "
+    "the surrounding code style, keeping the diff minimal — the user's "
+    "requirement wins.\n"
+    "Before you report the work finished, re-read these requirements and check "
+    "that what you produced satisfies each one that applies to it."
+)
+
+
+#: Values ``injection.explicitObservations`` accepts. "strip" drops the raw
+#: timestamped wall and injects only the distilled deductions and patterns;
+#: "keep" injects the representation as the backend rendered it.
+#:
+#: The choice is load-bearing rather than cosmetic. A requirement the user
+#: stated outright lives in the explicit layer; whether the deriver also rolled
+#: it up into a deduction is not guaranteed. Under "strip" such a requirement
+#: reaches the agent only if some pattern happens to cite it, which renders it
+#: as evidence for an inference rather than as an instruction.
+EXPLICIT_OBSERVATION_MODES = ("strip", "keep")
+DEFAULT_EXPLICIT_OBSERVATIONS = "strip"
+
+
+def _strip_explicit_observations(text: str) -> str:
+    """Drop the raw explicit-observations wall, keeping the distilled sections."""
+    return _EXPLICIT_OBSERVATIONS_SECTION.sub("", text).strip()
+
+
 # Gateway-internal notifications can arrive through the same user-role channel
 # as genuine user messages. They are execution metadata, not conversation, and
 # must never become durable personal memory. Keep this deliberately anchored:
@@ -301,6 +370,10 @@ class HonchoMemoryProvider(MemoryProvider):
         # which is the historical behaviour — see _format_first_turn_context.
         self._session_start_components: Optional[frozenset] = None
 
+        # How much of the peer representation to render. See
+        # EXPLICIT_OBSERVATION_MODES; the default preserves the strip.
+        self._explicit_observations: str = DEFAULT_EXPLICIT_OBSERVATIONS
+
         # Recall cadence and liveness state.
         self._turn_count = 0
         self._query_rewrite_enabled = False
@@ -418,6 +491,7 @@ class HonchoMemoryProvider(MemoryProvider):
             raw = getattr(cfg, "raw", None) or {}
             self._injection_log_path = self._resolve_injection_log_path(raw)
             self._session_start_components = self._resolve_session_start(raw)
+            self._explicit_observations = self._resolve_explicit_observations(raw)
 
             # aiPeer comes from honcho.json (host block or root) only.
             # SOUL.md is persona content, not identity config.
@@ -695,6 +769,18 @@ class HonchoMemoryProvider(MemoryProvider):
                 # able to see in a log, not an absence to be inferred later.
                 suppressed.append(f"{name} ({len(value)}B)")
                 continue
+            if (
+                name == "peerRepresentation"
+                and self._explicit_observations == "strip"
+                and isinstance(value, str)
+            ):
+                # The raw timestamped explicit observations can drown out the
+                # distilled deductions. Stripping them costs any requirement the
+                # deriver did not also roll up, so it is a configured choice
+                # rather than a fixed one — see EXPLICIT_OBSERVATION_MODES.
+                value = _strip_explicit_observations(value)
+                if not value:
+                    continue
             parts.append(f"{heading}\n{value}")
 
         if suppressed:
@@ -708,7 +794,19 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if not parts:
             return ""
-        return "\n\n".join(parts)
+        return "\n\n".join([self._subject_header()] + parts)
+
+    def _subject_header(self) -> str:
+        """The identity-binding preamble, naming the peer when it can be resolved."""
+        peer = ""
+        try:
+            if self._manager and self._session_key:
+                peer = self._manager.subject_peer_id(self._session_key)
+        except Exception as e:  # a header is never worth failing an injection over
+            logger.debug("Honcho subject peer resolution failed: %s", e)
+        if not peer:
+            return _MEMORY_SUBJECT_HEADER
+        return _MEMORY_SUBJECT_HEADER_NAMED.format(peer=peer)
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
@@ -769,6 +867,30 @@ class HonchoMemoryProvider(MemoryProvider):
         if not isinstance(listed, (list, tuple)):
             return None
         return frozenset(str(x) for x in listed)
+
+    @staticmethod
+    def _resolve_explicit_observations(raw: dict) -> str:
+        """``injection.explicitObservations``, or the default if unset.
+
+        An unrecognised value falls back to the default rather than raising: a
+        typo here must not cost the whole injection, and the log line makes the
+        fallback visible instead of silent.
+        """
+        injection = raw.get("injection")
+        if not isinstance(injection, dict):
+            return DEFAULT_EXPLICIT_OBSERVATIONS
+        value = injection.get("explicitObservations")
+        if value is None:
+            return DEFAULT_EXPLICIT_OBSERVATIONS
+        mode = str(value).strip().lower()
+        if mode not in EXPLICIT_OBSERVATION_MODES:
+            logger.warning(
+                "Honcho injection.explicitObservations=%r is not one of %s; "
+                "using %r",
+                value, list(EXPLICIT_OBSERVATION_MODES), DEFAULT_EXPLICIT_OBSERVATIONS,
+            )
+            return DEFAULT_EXPLICIT_OBSERVATIONS
+        return mode
 
     @staticmethod
     def _resolve_injection_log_path(raw: dict) -> Optional[str]:
@@ -904,6 +1026,7 @@ class HonchoMemoryProvider(MemoryProvider):
             parts.append(auth_notice)
 
         # ----- Layer 1: Base context (representation + card) -----
+        base_context = ""
         if not _skip_base:
             # The first base fetch gets the remaining turn-1 budget. Later
             # refreshes are consumed asynchronously.
@@ -1027,7 +1150,20 @@ class HonchoMemoryProvider(MemoryProvider):
 
         result = "\n\n".join(parts)
 
+        # Budget the body, then append the directive, so the directive is not
+        # the first thing a truncation drops — it is the shortest part of the
+        # payload and the only part that says what to do with the rest.
         result = self._truncate_to_budget(result)
+
+        # The directive earns its place only when something preference-bearing
+        # arrived. A card-only or summary-only injection states no requirements,
+        # so telling the model to obey them would point at nothing.
+        carries_preferences = (
+            "## User Representation" in base_context
+            or bool(dialectic_result and dialectic_result.strip())
+        )
+        if carries_preferences:
+            result = f"{result}\n\n{_MEMORY_DIRECTIVE}"
 
         return self._log_injection("injected", result)
 

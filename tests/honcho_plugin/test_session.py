@@ -1315,3 +1315,63 @@ class TestGetSessionContextFallback:
         assert peer_id == "user-peer"
         assert target == "user-peer"
 
+
+class TestExplicitObservationsMode:
+    """`injection.explicitObservations` decides which layers reach the agent.
+
+    Load-bearing rather than cosmetic: a requirement the user stated outright
+    lives in the explicit layer, and the deriver does not always roll it up into
+    a deduction. Under "strip" such a requirement reaches the agent only if some
+    pattern happens to cite it as evidence.
+    """
+
+    REPRESENTATION = (
+        "## Explicit Observations\n"
+        "\n"
+        "[2026-08-11] mei wants the Arrange, Act, and Assert sections marked.\n"
+        "\n"
+        "## Deductive Observations\n"
+        "\n"
+        "[2026-08-11] mei values uniform test structure.\n"
+    )
+
+    @staticmethod
+    def _provider(mode=None):
+        provider = HonchoMemoryProvider()
+        raw = {} if mode is None else {"injection": {"explicitObservations": mode}}
+        provider._explicit_observations = provider._resolve_explicit_observations(raw)
+        return provider
+
+    def test_unset_defaults_to_strip(self):
+        """Preserves the behaviour every recorded run was produced under."""
+        assert self._provider()._explicit_observations == "strip"
+
+    def test_keep_renders_the_explicit_layer(self):
+        formatted = self._provider("keep")._format_first_turn_context(
+            {"representation": self.REPRESENTATION}
+        )
+        assert "Explicit Observations" in formatted
+        assert "sections marked" in formatted
+
+    def test_strip_drops_the_explicit_layer(self):
+        formatted = self._provider("strip")._format_first_turn_context(
+            {"representation": self.REPRESENTATION}
+        )
+        assert "Explicit Observations" not in formatted
+        assert "sections marked" not in formatted
+        assert "values uniform test structure" in formatted
+
+    def test_unknown_mode_falls_back_rather_than_raising(self):
+        """A typo must cost the setting, never the whole injection."""
+        assert self._provider("distilled")._explicit_observations == "strip"
+
+    def test_mode_is_case_and_space_insensitive(self):
+        assert self._provider("  KEEP ")._explicit_observations == "keep"
+
+    def test_strip_leaving_nothing_skips_the_component(self):
+        """An explicit-only representation is empty once stripped, so the
+        heading must not be rendered over an empty body."""
+        formatted = self._provider("strip")._format_first_turn_context(
+            {"representation": "## Explicit Observations\n\n[2026-08-11] a thing.\n"}
+        )
+        assert "User Representation" not in formatted
