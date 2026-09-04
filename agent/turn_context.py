@@ -25,6 +25,7 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
     anchored_context_tokens, estimate_messages_tokens_rough, estimate_request_tokens_rough
 )
+from agent.turn_author import scope_for, parse_turn_author
 
 logger = logging.getLogger(__name__)
 
@@ -683,7 +684,7 @@ def _memory_turn_start_and_prefetch(
         agent._memory_manager.on_turn_start(
             agent._user_turn_count, _query,
             author_id=_author.get("id") or None, author_name=_author.get("name") or None,
-            author_is_bot=bool(_author.get("is_bot")),
+            author_is_bot=bool(_author.get("is_bot")), scope=scope_for(_author),
         )
     ext_prefetch_cache = ""
     with suppress(Exception):
@@ -769,6 +770,12 @@ def build_turn_context(
 
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
+
+    # Reset first: a cached gateway agent must never carry the previous turn's bot author into a
+    # human turn. The end-of-turn memory sync reads these back.
+    turn_author = parse_turn_author(turn_author)
+    agent._turn_author = turn_author
+    agent._turn_scope = scope_for(turn_author)
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.
