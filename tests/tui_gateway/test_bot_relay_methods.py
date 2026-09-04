@@ -193,3 +193,72 @@ def test_deliver_write_failure_still_removes_tempfile(home, monkeypatch, tmp_pat
     assert "error" in err
     assert made, "mkstemp was never reached"
     assert not glob.glob(str(tmp_path / "hermes-relay-dm-*")), "tempfile leaked"
+
+
+def test_deliver_sets_turn_author_env_from_sender_fields(home, monkeypatch):
+    """The delivery turn's child sees HERMES_TURN_AUTHOR built from the envelope's sender."""
+    from agent.turn_author import TURN_AUTHOR_ENV
+
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setenv("HERMES_RELAY_TEST_MARKER", "kept")
+    _result(srv._methods["bot_relay.deliver"](
+        1, {"profile": "ops", "message": "ping", "from_profile": "scout", "from_handle": "scout"}))
+    env = calls[0]["env"]
+    assert json.loads(env[TURN_AUTHOR_ENV]) == {"id": "bot:scout", "name": "scout", "is_bot": True}
+    assert env["HERMES_RELAY_TEST_MARKER"] == "kept"
+
+
+def test_deliver_without_sender_fields_leaves_turn_unattributed(home, monkeypatch):
+    from agent.turn_author import TURN_AUTHOR_ENV
+
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    # A stale author on the gateway's own environment must not reach the child either.
+    monkeypatch.setenv(TURN_AUTHOR_ENV, json.dumps({"id": "bot:stale", "name": "stale", "is_bot": True}))
+    _result(srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "ping"}))
+    assert TURN_AUTHOR_ENV not in calls[0]["env"]
+
+
+def test_deliver_retry_carries_the_same_turn_author(home, monkeypatch):
+    from agent.turn_author import TURN_AUTHOR_ENV
+
+    calls = []
+    outcomes = [(1, "HTTP 429 rate limit"), (0, "")]
+
+    def _fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        code, err = outcomes.pop(0)
+
+        class _Proc:
+            returncode = code
+            stdout = "ok" if code == 0 else ""
+            stderr = err
+
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    _result(srv._methods["bot_relay.deliver"](
+        1, {"profile": "ops", "message": "ping", "from_profile": "scout", "from_handle": "scout"}))
+    assert len(calls) == 2
+    assert [json.loads(c["env"][TURN_AUTHOR_ENV])["id"] for c in calls] == ["bot:scout", "bot:scout"]
