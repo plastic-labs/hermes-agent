@@ -225,6 +225,106 @@ class TestExtractCacheBustingConfig:
 
         assert out["tools.registry_generation"] == 12345
 
+    # -- Provider-declared identity (MemoryProvider.identity_signature) ------
+
+    @staticmethod
+    def _provider_declared_keys(out):
+        """``memory.*`` keys a provider added, excluding the config.yaml keys already documented."""
+        from gateway.run import GatewayRunner
+
+        documented = {f"{s}.{k}" for s, k in GatewayRunner._CACHE_BUSTING_CONFIG_KEYS if s == "memory"}
+        return sorted(k for k in out if k.startswith("memory.") and k not in documented)
+
+    @staticmethod
+    def _install_fake_provider(monkeypatch, provider):
+        """Route ``load_memory_provider`` to ``provider`` and start from an empty memo."""
+        import plugins.memory as plugins_memory
+        from gateway.run_agent_cache import GatewayAgentCacheMixin
+
+        calls = []
+
+        def _load(name, *, register_skills=None):
+            calls.append((name, register_skills))
+            return provider
+
+        monkeypatch.setattr(plugins_memory, "load_memory_provider", _load)
+        monkeypatch.setattr(GatewayAgentCacheMixin, "_MEMORY_IDENTITY_PROVIDER_MEMO", {})
+        return calls
+
+    def test_provider_identity_signature_enters_under_memory_prefix(self, monkeypatch):
+        from gateway.run import GatewayRunner
+        from tests.agent.test_memory_provider import FakeMemoryProvider
+
+        class IdentityProvider(FakeMemoryProvider):
+            def identity_signature(self):
+                return {"fakeprov.writer": "alice", "fakeprov.aliases": [("a", "b")]}
+
+        calls = self._install_fake_provider(monkeypatch, IdentityProvider("fakeprov"))
+
+        out = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "fakeprov"}})
+
+        assert out["memory.fakeprov.writer"] == "alice"
+        assert out["memory.fakeprov.aliases"] == [("a", "b")]
+        assert self._provider_declared_keys(out) == ["memory.fakeprov.aliases", "memory.fakeprov.writer"]
+        assert calls == [("fakeprov", False)]
+
+    def test_provider_instance_is_memoized_but_signature_is_re_read(self, monkeypatch):
+        from gateway.run import GatewayRunner
+        from tests.agent.test_memory_provider import FakeMemoryProvider
+
+        class IdentityProvider(FakeMemoryProvider):
+            writer = "alice"
+
+            def identity_signature(self):
+                return {"fakeprov.writer": self.writer}
+
+        provider = IdentityProvider("fakeprov")
+        calls = self._install_fake_provider(monkeypatch, provider)
+        cfg = {"memory": {"provider": "fakeprov"}}
+
+        first = GatewayRunner._extract_cache_busting_config(cfg)
+        provider.writer = "bob"
+        second = GatewayRunner._extract_cache_busting_config(cfg)
+
+        assert first["memory.fakeprov.writer"] == "alice"
+        assert second["memory.fakeprov.writer"] == "bob"
+        assert len(calls) == 1
+
+    def test_provider_without_identity_hook_contributes_nothing(self, monkeypatch):
+        from gateway.run import GatewayRunner
+        from tests.agent.test_memory_provider import FakeMemoryProvider
+
+        self._install_fake_provider(monkeypatch, FakeMemoryProvider("plain"))
+
+        out = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "plain"}})
+
+        assert self._provider_declared_keys(out) == []
+
+    def test_no_configured_provider_contributes_nothing(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        calls = self._install_fake_provider(monkeypatch, None)
+
+        out = GatewayRunner._extract_cache_busting_config({})
+
+        assert self._provider_declared_keys(out) == []
+        assert calls == []
+
+    def test_failing_identity_hook_is_swallowed(self, monkeypatch):
+        from gateway.run import GatewayRunner
+        from tests.agent.test_memory_provider import FakeMemoryProvider
+
+        class BrokenProvider(FakeMemoryProvider):
+            def identity_signature(self):
+                raise RuntimeError("boom")
+
+        self._install_fake_provider(monkeypatch, BrokenProvider("broken"))
+
+        out = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "broken"}})
+
+        assert self._provider_declared_keys(out) == []
+        assert "tools.registry_generation" in out
+
 
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""
