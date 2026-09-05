@@ -1,4 +1,4 @@
-"""Sliding-window budget for bot-authored inbound messages (#91481).
+"""Sliding-window budget for bot-authored inbound messages.
 
 ``{PLATFORM}_ALLOW_BOTS`` only decides admission. When two Hermes profiles reply to each
 other, every reply satisfies the ``mentions`` test again, so nothing ends the exchange.
@@ -53,8 +53,13 @@ def _as_positive(raw, default: float) -> float:
     return value if value > 0 else default
 
 
+def _as_positive_int(raw, default: int) -> int:
+    value = _as_positive(raw, 0.0)
+    return int(value) if value >= 1 and value == int(value) else default
+
+
 def settings_from_config(cfg) -> BotLoopGuardSettings:
-    """Read ``gateway.bot_loop_guard`` from a loaded config dict; unusable values keep the default."""
+    """Read ``gateway.bot_loop_guard`` from a loaded config dict. Unusable values keep the default."""
     from hermes_cli.config import cfg_get
 
     block = cfg_get(cfg, "gateway", "bot_loop_guard", default=None)
@@ -63,14 +68,14 @@ def settings_from_config(cfg) -> BotLoopGuardSettings:
     defaults = BotLoopGuardSettings()
     return BotLoopGuardSettings(
         enabled=_as_bool(block.get("enabled"), defaults.enabled),
-        max_events=int(_as_positive(block.get("max_events"), defaults.max_events)),
+        max_events=_as_positive_int(block.get("max_events"), defaults.max_events),
         window_seconds=_as_positive(block.get("window_seconds"), defaults.window_seconds),
         cooldown_seconds=_as_positive(block.get("cooldown_seconds"), defaults.cooldown_seconds),
     )
 
 
 def load_settings() -> BotLoopGuardSettings:
-    """Settings from the live config.yaml; defaults when the config cannot be read."""
+    """Settings from the live config.yaml. Defaults when the config cannot be read."""
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -102,6 +107,13 @@ class BotLoopGuard:
     def tracked_conversations(self) -> int:
         with self._lock:
             return len(self._events)
+
+    def blocked(self, conversation: Hashable) -> bool:
+        """True while ``conversation`` is cooling down. Reads only, so callers may ask per message as often as they like."""
+        if not self._settings().enabled:
+            return False
+        with self._lock:
+            return self._cooldown_until.get(conversation, 0.0) > self._clock()
 
     def admit(self, conversation: Hashable) -> Tuple[bool, str]:
         """Count one admitted bot-authored message for ``conversation``.

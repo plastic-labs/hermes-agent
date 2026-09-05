@@ -248,7 +248,7 @@ class TestMemoryManager:
         assert legacy_provider.synced_turns == [("user", "assistant")]
 
     def test_sync_all_forwards_author_and_scope_only_to_providers_that_accept_them(self):
-        """A bot turn reaches the new-signature provider with its author; legacy and messages-only
+        """A bot turn reaches the new-signature provider with its author. Legacy and messages-only
         providers get the call without the keywords they cannot take."""
         legacy = FakeMemoryProvider("legacy")
         messages_only = MessagesMemoryProvider("messages")

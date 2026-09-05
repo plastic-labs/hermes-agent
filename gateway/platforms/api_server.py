@@ -3657,7 +3657,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
         provider/model must match or the turn fails; ``runtime`` metadata is attached.
-        ``turn_author`` only labels the turn for memory attribution; it grants nothing."""
+        ``turn_author`` only labels the turn for memory attribution. It grants nothing."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()

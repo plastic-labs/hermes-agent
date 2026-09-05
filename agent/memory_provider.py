@@ -132,7 +132,8 @@ class MemoryProvider(ABC):
         """Per-turn tick. kwargs may include remaining_tokens, model, platform, tool_count,
         author_id, author_name, author_is_bot, scope. The author trio names who wrote THIS turn:
         a shared session carries several participants and other agents, so a provider keying durable
-        state on identity must read it per turn. All three are None when the transport gave no author.
+        state on identity must read it per turn. With no author from the transport, author_id and
+        author_name are None and author_is_bot is False.
         ``scope`` (e.g. ``a2a:<bot id>``) is None for a human turn and mirrors the same-named
         ``sync_turn`` keyword."""
 
