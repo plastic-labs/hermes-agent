@@ -70,9 +70,26 @@ def test_quiet_one_shot_consumes_the_variable_before_the_turn(monkeypatch):
     assert TURN_AUTHOR_ENV not in os.environ
 
 
-def test_quiet_one_shot_without_env_passes_none(monkeypatch):
-    assert _run(monkeypatch, None)["turn_author"] is None
+def test_quiet_one_shot_without_env_keeps_the_old_call_shape(monkeypatch):
+    assert "turn_author" not in _run(monkeypatch, None)
 
 
-def test_quiet_one_shot_junk_env_passes_none(monkeypatch):
-    assert _run(monkeypatch, "not json")["turn_author"] is None
+def test_quiet_one_shot_junk_env_keeps_the_old_call_shape(monkeypatch):
+    assert "turn_author" not in _run(monkeypatch, "not json")
+
+
+def test_quiet_one_shot_skips_the_keyword_for_an_agent_that_cannot_take_it(monkeypatch):
+    """A wrapper with an older run_conversation signature must not crash the turn."""
+    recorded = []
+
+    def run_conversation(user_message, conversation_history=None):
+        recorded.append(user_message)
+        return {"final_response": "ok"}
+
+    fake = _fake_cli([])
+    fake.agent.run_conversation = run_conversation
+    monkeypatch.setenv(TURN_AUTHOR_ENV, json.dumps({"id": "bot:coder", "is_bot": True}))
+    with pytest.raises(SystemExit) as exc:
+        cli._run_quiet_single_query(fake, "hello")
+    assert exc.value.code == 0
+    assert recorded == ["hello"]
