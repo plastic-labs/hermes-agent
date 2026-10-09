@@ -166,6 +166,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._dialectic_empty_streak: int = 0
         # Set once a process that starts past turn 1 has replayed the previous turn's refresh.
         self._resume_catch_up_done = False
+        self._previous_turn_message = ""
 
         # Tools-only mode may defer session initialization until a tool call.
         self._session_initialized = False
@@ -605,7 +606,12 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         return self._log_injection("injected", self._truncate_to_budget("\n\n".join(parts)))
 
     def _previous_user_message(self) -> str:
-        """The user message that opened the previous turn, rejoined from the chunks sync_turn stored."""
+        """The user message that opened the previous turn.
+
+        Hermes passes it from its own transcript. Honcho's copy, rejoined from the chunks
+        sync_turn stored, is only a fallback: with saveMessages off nothing is stored."""
+        if self._previous_turn_message:
+            return self._previous_turn_message
         try:
             messages = list(self._manager.get_or_create(self._session_key).messages)
         except Exception as e:
@@ -786,6 +792,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         several participants, and the peer resolved at session init only names whoever opened it."""
         self._recall_generation = object()
         self._turn_count = turn_number
+        self._previous_turn_message = kwargs.get("previous_message") or ""
         self._turn_author = {"id": kwargs.get("author_id") or None, "name": kwargs.get("author_name") or None,
                              "is_bot": bool(kwargs.get("author_is_bot"))}
 
