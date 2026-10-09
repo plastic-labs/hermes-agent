@@ -3,6 +3,9 @@
 In one long-lived process, turn N's injection comes from the refresh queued at the end of
 turn N-1. ``hermes chat --resume <id> --query ...`` starts a new process at turn N, where that
 refresh never ran and later turns do not wait, so before this fix it injected nothing.
+
+Driven through the real MemoryManager: it abandons a provider prefetch after a few seconds,
+and a catch-up that waited inside prefetch() was abandoned with it.
 """
 
 import time
@@ -10,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.memory_manager import MemoryManager
 from plugins.memory.honcho import HonchoMemoryProvider
 from plugins.memory.honcho.client import HonchoClientConfig
 
@@ -57,15 +61,17 @@ def _resumed_provider(context_queries: list[str], *, save_messages: bool) -> Hon
 def test_resumed_turn_injects_the_previous_turns_refresh(save_messages, turn_start_kwargs):
     context_queries: list[str] = []
     provider = _resumed_provider(context_queries, save_messages=save_messages)
+    memory = MemoryManager(external_prefetch_timeout=0.2)
+    memory.add_provider(provider)
 
-    provider.on_turn_start(2, "Now decode it back.", **turn_start_kwargs)
-    injected = provider.prefetch("Now decode it back.")
+    memory.on_turn_start(2, "Now decode it back.", **turn_start_kwargs)
+    injected = memory.prefetch_all("Now decode it back.")
 
     assert f"conclusions recalled for: {PREVIOUS}" in injected
     assert "The user wants every encoder round-trip tested." in injected
     assert context_queries[0] == PREVIOUS
 
     # The catch-up stands in for one missed refresh; the next turn is an ordinary later turn.
-    provider.on_turn_start(3, "Cover the edge cases.", previous_message="Now decode it back.")
-    provider.prefetch("Cover the edge cases.")
+    memory.on_turn_start(3, "Cover the edge cases.", previous_message="Now decode it back.")
+    memory.prefetch_all("Cover the edge cases.")
     assert context_queries.count(PREVIOUS) == 1

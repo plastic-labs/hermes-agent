@@ -589,9 +589,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             ready = self._consume_pending_dialectic()
             return self._log_injection("trivial-prompt", self._truncate_to_budget(ready) if ready else "")
 
-        if self._turn_count > 1 and self._base_context_cache is None and not self._resume_catch_up_done:
-            self._catch_up_resumed_session()
-
         # One-time notice, relayed by the model, that auth is dead and memory is paused.
         parts = [self._pop_auth_notice()]
         # First-turn mode suppresses only the base layer; dialectic is independent.
@@ -628,6 +625,11 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             return ""
         return "\n".join([chunks[0], *(c.removeprefix("[continued] ") for c in chunks[1:])]).strip()
 
+    def _catch_up_budget(self) -> float:
+        """How long each catch-up step may wait: as long as a dialectic thread may run before it is stale."""
+        timeout = self._config.timeout if self._config and self._config.timeout else 8.0
+        return timeout * self._STALE_THREAD_MULTIPLIER
+
     def _catch_up_resumed_session(self) -> None:
         """Run the refresh the previous turn would have queued, and wait for it.
 
@@ -641,8 +643,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if not query or self._is_trivial_prompt(query):
             return
         previous_turn = self._turn_count - 1
-        timeout = self._config.timeout if self._config and self._config.timeout else 8.0
-        budget = timeout * self._STALE_THREAD_MULTIPLIER
+        budget = self._catch_up_budget()
 
         with self._base_context_lock:
             self._base_context_cache = ""
@@ -795,6 +796,14 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._previous_turn_message = kwargs.get("previous_message") or ""
         self._turn_author = {"id": kwargs.get("author_id") or None, "name": kwargs.get("author_name") or None,
                              "is_bot": bool(kwargs.get("author_is_bot"))}
+        # Here rather than in prefetch(): the memory manager abandons a prefetch after a few
+        # seconds, and the catch-up waits on Honcho as long as the refresh it replaces could.
+        if (turn_number > 1 and self._base_context_cache is None and not self._resume_catch_up_done
+                and not self._cron_skipped and self._recall_mode != "tools" and not self._recall_sync):
+            if self._init_thread is not None:
+                self._init_thread.join(timeout=self._catch_up_budget())
+            if self._session_ready():
+                self._catch_up_resumed_session()
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         """Discard in-flight recall even when the configured backend session is pinned."""
